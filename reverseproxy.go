@@ -33,27 +33,6 @@ var onExitFlushLoop func()
 // but failed to return an explicit error.
 var ErrResponseShortWrite = errors.New("short write")
 
-// A BufferPool is an interface for getting and returing temporary
-// byte slices for use by io.CopyBuffer.
-type BufferPool struct {
-    size int
-    buf  []byte
-}
-
-func (pool *BufferPool) Get() []byte {
-    buffer := pool.buf
-    pool.buf = nil
-    return buffer
-}
-
-func (pool *BufferPool) Put(v []byte) {
-    if pool.buf != nil {
-        fmt.Printf("Buffer already given out... should be nil")
-        return
-    }
-    pool.buf = v
-}
-
 /*
  *  HTTP reverse proxy using the standard library reverse proxy 
  *  
@@ -81,7 +60,7 @@ type HttpReverseProxy struct {
 
     // BufferPool specifies a buffer pool to get byte slices for use by
     // io.CopyBuffer when copying HTTP request and response bodies
-    BufferPool *BufferPool
+    BufferPool *bpool.BytePool
 
     // The application that is processes the HTTP data as it is
     // streamed to/from the server being proxied
@@ -91,7 +70,7 @@ type HttpReverseProxy struct {
 
 func NewHttpReverseProxy(target *url.URL, app HttpApplication) (*HttpReverseProxy, error) {
 
-    pool := bpool.BytePool(20, 524288)
+    pool := bpool.NewBytePool(20, 524288)
     director := func(req *http.Request) {
         targetQuery := target.RawQuery
         req.URL.Scheme = target.Scheme
@@ -157,10 +136,8 @@ func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, er
         fmt.Printf("Content Length is %d\n", req.Header.Get("Content-Length"))
 
         var buf []byte
-        if p.BufferPool != nil {
-            buf = p.BufferPool.Get()
-        }
         for {
+            buf := p.BufferPool.Get()
             nr, err := src.Read(buf)
             if nr > 0 {
                 nw, err := transport.Write(req, buf[0:nr])
@@ -179,9 +156,7 @@ func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, er
                 break
             }
         }
-        if p.BufferPool != nil {
-            p.BufferPool.Put(buf)
-        }
+        p.BufferPool.Put(buf)
     }
     resp, err := transport.ReadResponse(req)
     return resp, err
@@ -273,10 +248,8 @@ func (p *HttpReverseProxy) copyResponse(dst io.Writer, src io.Reader) (written i
 		}
 	}
     var buf []byte
-    if p.BufferPool != nil {
-        buf = p.BufferPool.Get()
-    }
 	for {
+        buf = p.BufferPool.Get()
 		nr, er := src.Read(buf)
 		if nr > 0 {
             // invoke the application callback, if registered
@@ -305,9 +278,7 @@ func (p *HttpReverseProxy) copyResponse(dst io.Writer, src io.Reader) (written i
 			break
 		}
 	}
-    if p.BufferPool != nil {
-        p.BufferPool.Put(buf)
-    }
+    p.BufferPool.Put(buf)
     return written, err
 }
 
