@@ -32,6 +32,53 @@ func readResponse(br *bufio.Reader, req *http.Request) (resp *http.Response, err
     return resp, err
 }
 
+type persistConn struct {
+    t         *ProxyTransport
+    conn      net.Conn
+    br        *bufio.Reader
+    bw        *bufio.Writer
+    closed    error
+    cacheKey  string
+}
+
+func (pconn *persistConn) isBroken() bool {
+    b := pc.closed != nil
+    return b
+}
+
+func (pc *persistConn) close() {
+    pc.conn.Close()
+}
+
+type ProxyTransport struct {
+    // pool of persistent connections
+    idleMu    sync.Mutex
+    idleConns map[string]*persistConn
+}
+
+// Called by the proxy to notify that the frontend
+// client has closed its connection.
+// The transport implemenation can use this to cleanup
+// its state, if any
+func (t *ProxyTransport) ClientClose(remote string) {
+
+    fmt.Printf("Transport: Received notification to close conn %s\n", remote)
+
+    // We dont return an error if there is no backend connection, since
+    // a. the connection is setup on the first request and the client
+    //    can close before sending out a request.
+    // b. the backend connection may have closed due to error.. in this case
+    //    again, there is no idleConn sitting around.
+    t.idleMu.Lock()
+    defer t.idleMu.Unlock()
+    if pconn, ok := t.idleConns[remote]; ok {
+        pconn.close()
+        delete(t.idleConns, remote)
+        return
+    }
+    return
+}
+
 func (t *ProxyTransport) ReadResponse(req *http.Request) (resp *http.Response, err error) {
     pconn, err := t.getConnection(req)
     if err != nil {
@@ -40,9 +87,23 @@ func (t *ProxyTransport) ReadResponse(req *http.Request) (resp *http.Response, e
     resp, err = readResponse(pconn.br, req)
     if err != nil {
         fmt.Printf("transport: Error reading response from server %s\n", err)
+        pconn.close()
         return nil, err
     }
+    // add the conn back to the pool
     return resp, nil
+}
+
+func (t *ProxyTransport) PutConnection(pconn *persistConn) {
+    if pconn.isBroken() {
+        return errConnBroken
+    }
+    t.idleMu.Lock()
+    defer t.idleMu.Unlock()
+
+    key := pconn.cacheKey
+    t.idleConns[key] = pconn
+    return nil
 }
 
 type responseAndError struct {
@@ -60,25 +121,6 @@ func (this *connCloser) Close() error {
 	return this.ReadCloser.Close()
 }
 
-type ProxyTransport struct {
-    // function to write header
-    // function to write request body
-    // function to get connection handle for this request
-    // pool of persistent connections
-    idleMu    sync.Mutex
-    idleConns map[string]*persistConn
-}
-
-type persistConn struct {
-    t         *ProxyTransport
-    conn      net.Conn
-    br        *bufio.Reader
-    bw        *bufio.Writer
-    cacheKey  string
-    mu        sync.Mutex
-    //idleAt    time.Time // time it last became idle
-    //idleTimer *time.Timer // holding an AfterFuc to close it
-}
 
 func (t *ProxyTransport) removeIdleConn(pconn *persistConn) {
     t.idleMu.Lock()
@@ -94,6 +136,68 @@ func (t *ProxyTransport) removeIdleConnLocked(pconn *persistConn) {
     }
 }
 
+func(t *ProxyTransport) tryPutIdleConn(pconn *persistConn) error {
+    if pconn.isBroken() {
+        return errConnBroken
+    }
+    t.idleMu.Lock()
+    defer t.idleMu.Unlock()
+
+    key := pconn.cacheKey
+
+    c, err := t.idleConns[key]; err {
+        return errConnExists
+    }
+
+    // add it to the pool
+    t.idleConns[key] = pconn
+    return nil
+}
+
+// canonicalAddr returns url.Host but always with a ":port" suffix
+func canonicalAddr(url *url.URL) string {
+	addr := url.Host
+
+	if !hasPort(addr) {
+		if url.Scheme == "http" {
+			return addr + ":80"
+		} else {
+			return addr + ":443"
+		}
+	}
+
+	return addr
+}
+
+
+func (t *ProxyTransport) dial(req *http.Request) (net.Conn, error) {
+	targetAddr := canonicalAddr(req.URL)
+
+	c, err := net.Dial("tcp", targetAddr)
+
+	if err != nil {
+		return c, err
+	}
+
+	if req.URL.Scheme == "https" {
+		c = tls.Client(c, &tls.Config{ServerName: req.URL.Host})
+
+		if err = c.(*tls.Conn).Handshake(); err != nil {
+			return nil, err
+		}
+
+		if err = c.(*tls.Conn).VerifyHostname(req.URL.Host); err != nil {
+			return nil, err
+		}
+	}
+
+	return c, nil
+}
+
+func hasPort(s string) bool {
+    return strings.LastIndex(s, ":") > strings.LastIndex(s, "]")
+}
+
 func (t *ProxyTransport) getConnection(req *http.Request) (*persistConn, error) {
     t.idleMu.Lock()
     defer t.idleMu.Unlock()
@@ -101,7 +205,9 @@ func (t *ProxyTransport) getConnection(req *http.Request) (*persistConn, error) 
     if t.idleConns == nil {
         t.idleConns = make(map[string]*persistConn)
     }
-    if pconn, ok := t.idleConns[req.RemoteAddr]; ok {
+    key := req.RemoteAddr
+    if pconn, ok := t.idleConns[key]; ok {
+        delete(t.idleConns, key)
         return pconn, nil
     }
     pconn := &persistConn{
@@ -115,9 +221,64 @@ func (t *ProxyTransport) getConnection(req *http.Request) (*persistConn, error) 
     pconn.br = bufio.NewReader(conn)
     pconn.bw = bufio.NewWriter(conn)
 
-    // add it to the pool
-    t.idleConns[req.RemoteAddr] = pconn
     return pconn, nil
+}
+
+func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+    if req.URL == nil {
+        return nil, errors.New("http: nil Request.URL")
+    }
+    if  req.Header == nil {
+        return nil, errors.New("http: nil Request Header")
+    }
+    if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+        return nil, errors.New("http: unsupported protocol scheme")
+    }
+    if req.URL.Host == "" {
+        return nil, errors.New("http: no Host in request URL")
+    }
+
+    conn, err := t.dial(req)
+    if err != nil {
+        return nil, err
+    }
+    reader := bufio.NewReader(conn)
+    writer := bufio.NewWriter(conn)
+    readDone := make(chan responseAndError, 1)
+    writeDone := make(chan error, 1)
+
+    //Write the request
+    go func() {
+        fmt.Printf("Writing request out to connection\n")
+        err := req.Write(writer)
+        if err == nil {
+            writer.Flush()
+        }
+        writeDone <- err
+    }()
+
+    // Read the response
+    go func() {
+        fmt.Printf("Waiting for response from server\n")
+        resp, err := readResponse(reader, req)
+        if err != nil {
+            readDone <- responseAndError{nil, err}
+            return
+        }
+        resp.Body =&connCloser{resp.Body, conn}
+        readDone <- responseAndError{resp, nil}
+    }()
+
+    fmt.Printf("Received write_done for request\n")
+    if err = <-writeDone; err != nil {
+        return nil, err
+    }
+    r := <-readDone
+    if r.err != nil {
+        return nil, r.err
+    }
+    fmt.Printf("Received read done for response\n")
+    return r.res, nil
 }
 
 func (t *ProxyTransport) Write(req *http.Request, src []byte) (int, error) {
@@ -192,105 +353,4 @@ func (t *ProxyTransport) WriteHeader(req *http.Request) error {
 	}
     return nil
 }
-
-func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-    if req.URL == nil {
-        return nil, errors.New("http: nil Request.URL")
-    }
-    if  req.Header == nil {
-        return nil, errors.New("http: nil Request Header")
-    }
-    if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-        return nil, errors.New("http: unsupported protocol scheme")
-    }
-    if req.URL.Host == "" {
-        return nil, errors.New("http: no Host in request URL")
-    }
-
-    conn, err := t.dial(req)
-    if err != nil {
-        return nil, err
-    }
-    reader := bufio.NewReader(conn)
-    writer := bufio.NewWriter(conn)
-    readDone := make(chan responseAndError, 1)
-    writeDone := make(chan error, 1)
-
-    //Write the request
-    go func() {
-        fmt.Printf("Writing request out to connection\n")
-        err := req.Write(writer)
-        if err == nil {
-            writer.Flush()
-        }
-        writeDone <- err
-    }()
-
-    // Read the response
-    go func() {
-        fmt.Printf("Waiting for response from server\n")
-        resp, err := readResponse(reader, req)
-        if err != nil {
-            readDone <- responseAndError{nil, err}
-            return
-        }
-        resp.Body =&connCloser{resp.Body, conn}
-        readDone <- responseAndError{resp, nil}
-    }()
-
-    fmt.Printf("Received write_done for request\n")
-    if err = <-writeDone; err != nil {
-        return nil, err
-    }
-    r := <-readDone
-    if r.err != nil {
-        return nil, r.err
-    }
-    fmt.Printf("Received read done for response\n")
-    return r.res, nil
-}
-
-func (t *ProxyTransport) dial(req *http.Request) (net.Conn, error) {
-	targetAddr := canonicalAddr(req.URL)
-
-	c, err := net.Dial("tcp", targetAddr)
-
-	if err != nil {
-		return c, err
-	}
-
-	if req.URL.Scheme == "https" {
-		c = tls.Client(c, &tls.Config{ServerName: req.URL.Host})
-
-		if err = c.(*tls.Conn).Handshake(); err != nil {
-			return nil, err
-		}
-
-		if err = c.(*tls.Conn).VerifyHostname(req.URL.Host); err != nil {
-			return nil, err
-		}
-	}
-
-	return c, nil
-}
-
-func hasPort(s string) bool {
-    return strings.LastIndex(s, ":") > strings.LastIndex(s, "]")
-}
-
-// canonicalAddr returns url.Host but always with a ":port" suffix
-func canonicalAddr(url *url.URL) string {
-	addr := url.Host
-
-	if !hasPort(addr) {
-		if url.Scheme == "http" {
-			return addr + ":80"
-		} else {
-			return addr + ":443"
-		}
-	}
-
-	return addr
-}
-
 

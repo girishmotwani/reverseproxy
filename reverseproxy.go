@@ -102,6 +102,23 @@ func copyHeader(dst, src http.Header) {
 
 func (p *HttpReverseProxy) Start() error {
     fmt.Printf("Starting Object Store service on port 8080\n");
+    //https://husobee.github.io/golang/tls/2016/01/27/golang-tls.html
+    connStateHandler := func (c net.Conn, state http.ConnState) {
+        // we are interested only in closed connections. 
+        // On a conn close, cleanup the corresponding backend connection
+        // to the Server.
+        if state == http.StateClosed {
+            remote := c.RemoteAddr().String()
+            err := p.ClientClose(remote)
+            if err != nil {
+                fmt.Printf("Proxy: Error cleaning up state for conn %s in proxyTransport\n", remote)
+            }
+        }
+    }
+    server := &http.Server{
+        Addr: ":8080",
+        ConnState: connStateHandler,
+    }
     http.ListenAndServe(":8080", p)
     return nil
 }
