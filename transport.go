@@ -37,13 +37,7 @@ type persistConn struct {
     conn      net.Conn
     br        *bufio.Reader
     bw        *bufio.Writer
-    closed    error
     cacheKey  string
-}
-
-func (pconn *persistConn) isBroken() bool {
-    b := pc.closed != nil
-    return b
 }
 
 func (pc *persistConn) close() {
@@ -51,7 +45,16 @@ func (pc *persistConn) close() {
 }
 
 type ProxyTransport struct {
-    // pool of persistent connections
+    // pool of persistent connections. The connections are key'ed by the 
+    // front-end client's address(ip:port). Also since the Std Library
+    // HTTP server implementation serializes the processing of requests
+    // from a client in a go-routine, a backend connection is 
+    // guaranteed to have no contention.
+    // Further, the ConnState Hook is invoked in the context of this 
+    // goroutine, so cleanup is relatively simpler. 
+    // In the event of a backend connection error, close the connection.
+    // A future request would result in a new connection being setup and
+    // the system recovering.
     idleMu    sync.Mutex
     idleConns map[string]*persistConn
 }
@@ -79,25 +82,18 @@ func (t *ProxyTransport) ClientClose(remote string) {
     return
 }
 
-func (t *ProxyTransport) ReadResponse(req *http.Request) (resp *http.Response, err error) {
-    pconn, err := t.getConnection(req)
-    if err != nil {
-        return nil, err
-    }
+func (t *ProxyTransport) ReadResponse(pconn *persistConn, req *http.Request) (resp *http.Response, err error) {
     resp, err = readResponse(pconn.br, req)
     if err != nil {
         fmt.Printf("transport: Error reading response from server %s\n", err)
         pconn.close()
         return nil, err
     }
-    // add the conn back to the pool
     return resp, nil
 }
 
-func (t *ProxyTransport) PutConnection(pconn *persistConn) {
-    if pconn.isBroken() {
-        return errConnBroken
-    }
+// return the connection back to the pool.
+func (t *ProxyTransport) PutConnection(pconn *persistConn) error {
     t.idleMu.Lock()
     defer t.idleMu.Unlock()
 
@@ -119,39 +115,6 @@ type connCloser struct {
 func (this *connCloser) Close() error {
 	this.conn.Close()
 	return this.ReadCloser.Close()
-}
-
-
-func (t *ProxyTransport) removeIdleConn(pconn *persistConn) {
-    t.idleMu.Lock()
-    defer t.idleMu.Unlock()
-    t.removeIdleConnLocked(pconn)
-}
-
-func (t *ProxyTransport) removeIdleConnLocked(pconn *persistConn) {
-    key := pconn.cacheKey
-    c, _ := t.idleConns[key]
-    if c == pconn {
-        delete(t.idleConns, key)
-    }
-}
-
-func(t *ProxyTransport) tryPutIdleConn(pconn *persistConn) error {
-    if pconn.isBroken() {
-        return errConnBroken
-    }
-    t.idleMu.Lock()
-    defer t.idleMu.Unlock()
-
-    key := pconn.cacheKey
-
-    c, err := t.idleConns[key]; err {
-        return errConnExists
-    }
-
-    // add it to the pool
-    t.idleConns[key] = pconn
-    return nil
 }
 
 // canonicalAddr returns url.Host but always with a ":port" suffix
@@ -198,7 +161,7 @@ func hasPort(s string) bool {
     return strings.LastIndex(s, ":") > strings.LastIndex(s, "]")
 }
 
-func (t *ProxyTransport) getConnection(req *http.Request) (*persistConn, error) {
+func (t *ProxyTransport) GetConnection(req *http.Request) (*persistConn, error) {
     t.idleMu.Lock()
     defer t.idleMu.Unlock()
 
@@ -281,18 +244,14 @@ func (t *ProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
     return r.res, nil
 }
 
-func (t *ProxyTransport) Write(req *http.Request, src []byte) (int, error) {
-    pconn, err := t.getConnection(req)
-    if err != nil {
-        return 0, err
-    }
+func (t *ProxyTransport) Write(pconn *persistConn, req *http.Request, src []byte) (int, error) {
     w := pconn.bw
     nw, err := w.Write(src)
 	if err != nil {
+        pconn.close()
 		return nw, err
 	}
     return nw, nil
-    //return nw, w.Flush()
 }
 
 func (t *ProxyTransport) writeHeader(w *bufio.Writer, req *http.Request) error {
@@ -341,14 +300,11 @@ func (t *ProxyTransport) writeHeader(w *bufio.Writer, req *http.Request) error {
 
 var ProxyErrMissingHost = errors.New("proxy: Request with no Host or URL set")
 
-func (t *ProxyTransport) WriteHeader(req *http.Request) error {
+func (t *ProxyTransport) WriteHeader(pconn *persistConn, req *http.Request) error {
 
-    pconn, err := t.getConnection(req)
-    if err != nil {
-        return err
-    }
-    err = t.writeHeader(pconn.bw, req)
+    err := t.writeHeader(pconn.bw, req)
 	if err != nil {
+        pconn.close()
 		return err
 	}
     return nil

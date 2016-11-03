@@ -5,6 +5,7 @@ import (
     "errors"
     "fmt"
     "log"
+    "net"
     "net/http"
     "net/url"
     "strings"
@@ -109,17 +110,17 @@ func (p *HttpReverseProxy) Start() error {
         // to the Server.
         if state == http.StateClosed {
             remote := c.RemoteAddr().String()
-            err := p.ClientClose(remote)
-            if err != nil {
-                fmt.Printf("Proxy: Error cleaning up state for conn %s in proxyTransport\n", remote)
-            }
+            transport := p.Transport
+
+            transport.ClientClose(remote)
         }
     }
     server := &http.Server{
         Addr: ":8080",
         ConnState: connStateHandler,
+        Handler: p,
     }
-    http.ListenAndServe(":8080", p)
+    server.ListenAndServe()
     return nil
 }
 
@@ -140,7 +141,14 @@ var hopHeaders = []string{
 func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, error) {
     transport := p.Transport
 
-    err := transport.WriteHeader(req)
+    //first get the connection object
+    conn, err := transport.GetConnection(req)
+    if err != nil {
+        fmt.Printf("proxy: Failed to get a connection to the backend server: %s\n", err)
+        return nil, err
+    }
+
+    err = transport.WriteHeader(conn, req)
     if err != nil {
         fmt.Printf("proxy: Failed to send Request Headers to backend: %s\n", err)
         return nil, err
@@ -157,7 +165,7 @@ func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, er
             buf := p.BufferPool.Get()
             nr, err := src.Read(buf)
             if nr > 0 {
-                nw, err := transport.Write(req, buf[0:nr])
+                nw, err := transport.Write(conn, req, buf[0:nr])
                 if err != nil {
                     fmt.Printf("Error: Writing request body\n")
                     break
@@ -175,7 +183,8 @@ func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, er
         }
         p.BufferPool.Put(buf)
     }
-    resp, err := transport.ReadResponse(req)
+    resp, err := transport.ReadResponse(conn, req)
+    transport.PutConnection(conn)
     return resp, err
 }
 
