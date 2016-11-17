@@ -1,96 +1,99 @@
 package reverseproxy
 
 import (
-    "io"
-    "errors"
-    "fmt"
-    "log"
-    "net"
-    "net/http"
-    "net/url"
-    "strings"
-    "sync"
-    "time"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/oxtoacart/bpool"
+	"github.com/oxtoacart/bpool"
+	"github.com/pborman/uuid"
 )
 
 // HTTP proxy application
-// This interface encapsulates the methods that the HTTP 
-// processing application needs to implement to 
+// This interface encapsulates the methods that the HTTP
+// processing application needs to implement to
 // use the reverse proxy service
 // - a handler to process HTTP Requests
 // - a handler to process HTTP Responses
 type HttpApplication interface {
-    RequestHandler(req *http.Request) error
-    ResponseHandler(resp *http.Response) error
+	RequestHandler(flow *HttpFlow) error
+	ResponseHandler(flow *HttpFlow) error
+	RequestDataHandler(flow *HttpFlow, buf []byte) error
+	ResponseDataHandler(resp *HttpFlow, buf []byte) error
 }
-
-// onExitFlushLoop is a callback set by tests to detect the state of the
-// flushLoop() goroutine.
-var onExitFlushLoop func()
 
 // ErrResponseShortWrite means that a write accepted fewer bytes than requested
 // but failed to return an explicit error.
 var ErrResponseShortWrite = errors.New("short write")
 
-/*
- *  HTTP reverse proxy using the standard library reverse proxy 
- *  
- *    target: 
- */
-type HttpReverseProxy struct {
-    // Director must be a function that modified the request into a new
-    // request to be sent using Transport. Its response is then copied
-    // back to the client
-    Director func(*http.Request)
-
-    // The transport used to perform proxy requests.
-    // If nil, http.DefaultTransport is used
-    Transport *ProxyTransport
-
-    // FlushInterval specifies the flush interval to flush to the client
-    // while copying the response body. 
-    // If zero, no periodic flushing is done 
-    FlushInterval time.Duration
-
-    // ErrorLog specifies an optional logger for errors that occur when
-    // attempting to process the request. If nil, logging goes to os.Stderr
-    // using the standard logger
-    ErrorLog *log.Logger
-
-    // BufferPool specifies a buffer pool to get byte slices for use by
-    // io.CopyBuffer when copying HTTP request and response bodies
-    BufferPool *bpool.BytePool
-
-    // The application that is processes the HTTP data as it is
-    // streamed to/from the server being proxied
-    app    HttpApplication
+type HttpFlow struct {
+	Id       string
+	Request  *http.Request
+	Response *http.Response
 }
 
+func Uuid() string {
+	return uuid.New()
+}
+
+/*
+ *  HTTP reverse proxy using the standard library reverse proxy
+ *
+ *    target:
+ */
+type HttpReverseProxy struct {
+	// Director must be a function that modified the request into a new
+	// request to be sent using Transport. Its response is then copied
+	// back to the client
+	Director func(*http.Request)
+
+	// The transport used to perform proxy requests.
+	// If nil, http.DefaultTransport is used
+	Transport *ProxyTransport
+
+	// ErrorLog specifies an optional logger for errors that occur when
+	// attempting to process the request. If nil, logging goes to os.Stderr
+	// using the standard logger
+	ErrorLog *log.Logger
+
+	// BufferPool specifies a buffer pool to get byte slices for use by
+	// io.CopyBuffer when copying HTTP request and response bodies
+	BufferPool *bpool.BytePool
+
+	// The application that is processes the HTTP data as it is
+	// streamed to/from the server being proxied
+	app HttpApplication
+}
 
 func NewHttpReverseProxy(target *url.URL, app HttpApplication) (*HttpReverseProxy, error) {
 
-    pool := bpool.NewBytePool(20, 524288)
-    director := func(req *http.Request) {
-        targetQuery := target.RawQuery
-        req.URL.Scheme = target.Scheme
-        req.URL.Host = target.Host
-        if targetQuery == "" || req.URL.RawQuery == "" {
-            req.URL.RawQuery = targetQuery + req.URL.RawQuery
-        } else {
-            req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
-        }
-        //update the host header in the request
-        req.Host = target.Host
-    }
+	pool := bpool.NewBytePool(20, 524288)
+	director := func(req *http.Request) {
+		targetQuery := target.RawQuery
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		if targetQuery == "" || req.URL.RawQuery == "" {
+			req.URL.RawQuery = targetQuery + req.URL.RawQuery
+		} else {
+			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
+		}
+		//update the host header in the request
+		req.Host = target.Host
+	}
 
-    return &HttpReverseProxy{
-        Director: director,
-        Transport: &ProxyTransport{},
-        BufferPool: pool,
-        app: app,
-    }, nil
+	return &HttpReverseProxy{
+		Director:   director,
+		Transport:  &ProxyTransport{},
+		BufferPool: pool,
+		app:        app,
+	}, nil
 }
 
 func copyHeader(dst, src http.Header) {
@@ -102,26 +105,26 @@ func copyHeader(dst, src http.Header) {
 }
 
 func (p *HttpReverseProxy) Start() error {
-    fmt.Printf("Starting Object Store service on port 8080\n");
-    //https://husobee.github.io/golang/tls/2016/01/27/golang-tls.html
-    connStateHandler := func (c net.Conn, state http.ConnState) {
-        // we are interested only in closed connections. 
-        // On a conn close, cleanup the corresponding backend connection
-        // to the Server.
-        if state == http.StateClosed {
-            remote := c.RemoteAddr().String()
-            transport := p.Transport
+	fmt.Printf("Starting Reverse Proxy service on port 8080\n")
+	//https://husobee.github.io/golang/tls/2016/01/27/golang-tls.html
+	connStateHandler := func(c net.Conn, state http.ConnState) {
+		// we are interested only in closed connections.
+		// On a conn close, cleanup the corresponding backend connection
+		// to the Server.
+		if state == http.StateClosed {
+			remote := c.RemoteAddr().String()
+			transport := p.Transport
 
-            transport.ClientClose(remote)
-        }
-    }
-    server := &http.Server{
-        Addr: ":8080",
-        ConnState: connStateHandler,
-        Handler: p,
-    }
-    server.ListenAndServe()
-    return nil
+			transport.ClientClose(remote)
+		}
+	}
+	server := &http.Server{
+		Addr:      ":8080",
+		ConnState: connStateHandler,
+		Handler:   p,
+	}
+	server.ListenAndServe()
+	return nil
 }
 
 // Hop-by-hop headers. These are removed when sent to the backend.
@@ -139,62 +142,62 @@ var hopHeaders = []string{
 }
 
 func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, error) {
-    transport := p.Transport
+	transport := p.Transport
 
-    //first get the connection object
-    conn, err := transport.GetConnection(req)
-    if err != nil {
-        fmt.Printf("proxy: Failed to get a connection to the backend server: %s\n", err)
-        return nil, err
-    }
+	//first get the connection object
+	conn, err := transport.GetConnection(req)
+	if err != nil {
+		fmt.Printf("proxy: Failed to get a connection to the backend server: %s\n", err)
+		return nil, err
+	}
 
-    err = transport.WriteHeader(conn, req)
-    if err != nil {
-        fmt.Printf("proxy: Failed to send Request Headers to backend: %s\n", err)
-        return nil, err
-    }
+	err = transport.WriteHeader(conn, req)
+	if err != nil {
+		fmt.Printf("proxy: Failed to send Request Headers to backend: %s\n", err)
+		return nil, err
+	}
 
-    written := 0
-    // write the body out, if there is one
-    if req.Body != nil {
-        src := req.Body
-        fmt.Printf("Content Length is %d\n", req.Header.Get("Content-Length"))
+	written := 0
+	// write the body out, if there is one
+	if req.Body != nil {
+		src := req.Body
+		fmt.Printf("Content Length is %d\n", req.Header.Get("Content-Length"))
 
-        var buf []byte
-        for {
-            buf := p.BufferPool.Get()
-            nr, err := src.Read(buf)
-            if nr > 0 {
-                nw, err := transport.Write(conn, req, buf[0:nr])
-                if err != nil {
-                    fmt.Printf("Error: Writing request body\n")
-                    break
-                }
-                if nw != nr {
-                    fmt.Printf("Error: ShortRequestWrite\n")
-                    break
-                }
-                written += nw
-                fmt.Printf("Written %d bytes\n", written)
-            }
-            if err == io.EOF {
-                break
-            }
-        }
-        p.BufferPool.Put(buf)
-    }
-    resp, err := transport.ReadResponse(conn, req)
-    transport.PutConnection(conn)
-    return resp, err
+		var buf []byte
+		for {
+			buf := p.BufferPool.Get()
+			nr, err := src.Read(buf)
+			if nr > 0 {
+				nw, err := transport.Write(conn, req, buf[0:nr])
+				if err != nil {
+					fmt.Printf("Error: Writing request body\n")
+					break
+				}
+				if nw != nr {
+					fmt.Printf("Error: ShortRequestWrite\n")
+					break
+				}
+				written += nw
+				fmt.Printf("Written %d bytes\n", written)
+			}
+			if err == io.EOF {
+				break
+			}
+		}
+		p.BufferPool.Put(buf)
+	}
+	resp, err := transport.ReadResponse(conn, req)
+	transport.PutConnection(conn)
+	return resp, err
 }
 
 func (p *HttpReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	outreq := new(http.Request)
 	*outreq = *req // includes shallow copies of maps, but okay
-    if req.ContentLength == 0 {
-        outreq.Body = nil
-    }
+	if req.ContentLength == 0 {
+		outreq.Body = nil
+	}
 
 	p.Director(outreq)
 	outreq.Proto = "HTTP/1.1"
@@ -202,7 +205,7 @@ func (p *HttpReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	outreq.ProtoMinor = 1
 	outreq.Close = false
 
-    // Remove hop-by-hop headers listed in the "Connection" header.
+	// Remove hop-by-hop headers listed in the "Connection" header.
 	// See RFC 2616, section 14.10.
 	copiedHeaders := false
 	if c := outreq.Header.Get("Connection"); c != "" {
@@ -232,57 +235,50 @@ func (p *HttpReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 			outreq.Header.Del(h)
 		}
 	}
+	// create the flow object
+	flow := &HttpFlow{
+		Id:       Uuid(),
+		Request:  outreq,
+		Response: nil,
+	}
+	//now call the app handlers if registered
+	p.app.RequestHandler(flow)
 
-    //now call the app handlers if registered
-    //p.app.RequestHandler(outreq)
-
-    //send this request on its way out
-    res, err := p.processRequest(outreq)
-
-    //res, err := transport.RoundTrip(outreq)
+	//send this request on its way out
+	err := p.processRequest(flow)
 	if err != nil {
-        p.logf("http: proxy error: %v", err)
+		p.logf("http: proxy error: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer res.Body.Close()
+	defer flow.Response.Body.Close()
 
 	for _, h := range hopHeaders {
-		res.Header.Del(h)
+		flow.Response.Header.Del(h)
 	}
 
-    //now call the app handlers if registered
-    p.app.ResponseHandler(res)
+	//now call the app handlers if registered
+	p.app.ResponseHandler(flow)
 
-	copyHeader(rw.Header(), res.Header)
+	copyHeader(rw.Header(), flow.response.Header)
 
 	rw.WriteHeader(res.StatusCode)
-	p.copyResponse(rw, res.Body)
+	p.copyResponse(rw, flow)
 }
 
-func (p *HttpReverseProxy) copyResponse(dst io.Writer, src io.Reader) (written int64, err error) {
-	if p.FlushInterval != 0 {
-		if wf, ok := dst.(writeFlusher); ok {
-			mlw := &maxLatencyWriter{
-				dst:     wf,
-				latency: p.FlushInterval,
-				done:    make(chan bool),
-			}
-			go mlw.flushLoop()
-			defer mlw.stop()
-			dst = mlw
-		}
-	}
-    var buf []byte
+func (p *HttpReverseProxy) copyResponse(dst io.Writer, flow *HttpFlow) (written int64, err error) {
+	src := flow.Response.Body
+
+	var buf []byte
 	for {
-        buf = p.BufferPool.Get()
+		buf = p.BufferPool.Get()
 		nr, er := src.Read(buf)
 		if nr > 0 {
-            // invoke the application callback, if registered
-            // app may modify the request and return a different
-            // buffer. Also buffer here needs to be larger than 
-            // the data being read, so that app handler can
-            // modify contents and return update buffer.
+			// invoke the application callback, if registered
+			// app may modify the request and return a different
+			// buffer. Also buffer here needs to be larger than
+			// the data being read, so that app handler can
+			// modify contents and return update buffer.
 			nw, ew := dst.Write(buf[0:nr])
 			if nw > 0 {
 				written += int64(nw)
@@ -304,8 +300,8 @@ func (p *HttpReverseProxy) copyResponse(dst io.Writer, src io.Reader) (written i
 			break
 		}
 	}
-    p.BufferPool.Put(buf)
-    return written, err
+	p.BufferPool.Put(buf)
+	return written, err
 }
 
 func (p *HttpReverseProxy) logf(format string, args ...interface{}) {
@@ -314,45 +310,4 @@ func (p *HttpReverseProxy) logf(format string, args ...interface{}) {
 	} else {
 		log.Printf(format, args...)
 	}
-}
-
-type writeFlusher interface {
-	io.Writer
-	http.Flusher
-}
-
-type maxLatencyWriter struct {
-	dst     writeFlusher
-	latency time.Duration
-
-	lk   sync.Mutex // protects Write + Flush
-	done chan bool
-}
-
-func (m *maxLatencyWriter) Write(p []byte) (int, error) {
-	m.lk.Lock()
-	defer m.lk.Unlock()
-	return m.dst.Write(p)
-}
-
-func (m *maxLatencyWriter) flushLoop() {
-	t := time.NewTicker(m.latency)
-	defer t.Stop()
-	for {
-		select {
-		case <-m.done:
-			if onExitFlushLoop != nil {
-				onExitFlushLoop()
-			}
-			return
-		case <-t.C:
-			m.lk.Lock()
-			m.dst.Flush()
-			m.lk.Unlock()
-		}
-	}
-}
-
-func (m *maxLatencyWriter) stop() {
-    m.done <- true
 }
