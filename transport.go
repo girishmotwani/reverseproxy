@@ -181,8 +181,9 @@ func (t *ProxyTransport) GetConnection(req *http.Request) (*persistConn, error) 
     if err != nil {
         return nil, err
     }
-    pconn.br = bufio.NewReader(conn)
-    pconn.bw = bufio.NewWriter(conn)
+    pconn.conn = conn
+    pconn.br = bufio.NewReader(pconn.conn)
+    pconn.bw = bufio.NewWriter(pconn.conn)
 
     return pconn, nil
 }

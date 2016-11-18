@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/oxtoacart/bpool"
 	"github.com/pborman/uuid"
@@ -141,20 +139,21 @@ var hopHeaders = []string{
 	"Upgrade",
 }
 
-func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, error) {
+func (p *HttpReverseProxy) processRequest(flow *HttpFlow) error {
 	transport := p.Transport
 
+    req := flow.Request
 	//first get the connection object
 	conn, err := transport.GetConnection(req)
 	if err != nil {
 		fmt.Printf("proxy: Failed to get a connection to the backend server: %s\n", err)
-		return nil, err
+		return err
 	}
 
 	err = transport.WriteHeader(conn, req)
 	if err != nil {
 		fmt.Printf("proxy: Failed to send Request Headers to backend: %s\n", err)
-		return nil, err
+		return err
 	}
 
 	written := 0
@@ -186,9 +185,9 @@ func (p *HttpReverseProxy) processRequest(req *http.Request) (*http.Response, er
 		}
 		p.BufferPool.Put(buf)
 	}
-	resp, err := transport.ReadResponse(conn, req)
+	flow.Response, err = transport.ReadResponse(conn, req)
 	transport.PutConnection(conn)
-	return resp, err
+	return err
 }
 
 func (p *HttpReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -260,9 +259,9 @@ func (p *HttpReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	//now call the app handlers if registered
 	p.app.ResponseHandler(flow)
 
-	copyHeader(rw.Header(), flow.response.Header)
+	copyHeader(rw.Header(), flow.Response.Header)
 
-	rw.WriteHeader(res.StatusCode)
+	rw.WriteHeader(flow.Response.StatusCode)
 	p.copyResponse(rw, flow)
 }
 
