@@ -252,7 +252,7 @@ func (t *ProxyTransport) Write(pconn *persistConn, req *http.Request, src []byte
         pconn.close()
 		return nw, err
 	}
-    return nw, nil
+    return nw, w.Flush()
 }
 
 func (t *ProxyTransport) writeHeader(w *bufio.Writer, req *http.Request) error {
