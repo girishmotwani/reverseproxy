@@ -12,7 +12,7 @@ Users can register callbacks for
 Use cases:
 1. Use reverse proxy for load balancing
 2. Use reverse proxy for adding/modifying/deleting http request/response headers
-3. Use reverse proxy to modify the Request/Response data. For example, encrypt data.
+3. Use reverse proxy to modify the Request/Response data. For example, encrypt data
 4. Use reverse proxy to inspect data (read only)
 
 
