@@ -23,8 +23,8 @@ import (
 type HttpApplication interface {
 	RequestHandler(flow *HttpFlow) error
 	ResponseHandler(flow *HttpFlow) error
-	RequestDataHandler(flow *HttpFlow, buf []byte) error
-	ResponseDataHandler(resp *HttpFlow, buf []byte) error
+	RequestDataHandler(flow *HttpFlow, buf []byte) ([]byte, error)
+	ResponseDataHandler(resp *HttpFlow, buf []byte) ([]byte, error)
 }
 
 // ErrResponseShortWrite means that a write accepted fewer bytes than requested
@@ -165,8 +165,10 @@ func (p *HttpReverseProxy) processRequest(flow *HttpFlow) error {
 		var buf []byte
 		for {
 			buf := p.BufferPool.Get()
-			nr, err := src.Read(buf)
+			nr, err := io.ReadFull(src, buf)//.Read(buf)
 			if nr > 0 {
+                buf, err = p.app.RequestDataHandler(flow, buf[0:nr])
+                nr = len(buf)
 				nw, err := transport.Write(conn, req, buf[0:nr])
 				if err != nil {
 					fmt.Printf("Error: Writing request body\n")
@@ -271,13 +273,15 @@ func (p *HttpReverseProxy) copyResponse(dst io.Writer, flow *HttpFlow) (written 
 	var buf []byte
 	for {
 		buf = p.BufferPool.Get()
-		nr, er := src.Read(buf)
+		nr, er := io.ReadFull(src, buf)//.Read(buf)
 		if nr > 0 {
 			// invoke the application callback, if registered
 			// app may modify the request and return a different
 			// buffer. Also buffer here needs to be larger than
 			// the data being read, so that app handler can
 			// modify contents and return update buffer.
+            buf, err = p.app.ResponseDataHandler(flow, buf[0:nr])
+            nr = len(buf)
 			nw, ew := dst.Write(buf[0:nr])
 			if nw > 0 {
 				written += int64(nw)
@@ -290,6 +294,7 @@ func (p *HttpReverseProxy) copyResponse(dst io.Writer, flow *HttpFlow) (written 
 				err = ErrResponseShortWrite
 				break
 			}
+			fmt.Printf("Written %d bytes\n", written)
 		}
 		if er == io.EOF {
 			break
